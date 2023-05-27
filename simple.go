@@ -2,18 +2,25 @@ package gcache
 
 import (
 	"time"
+
+	"github.com/puper/gcache/timewheel"
 )
 
 // SimpleCache has no clear priority for evict cache. It depends on key-value map order.
 type SimpleCache struct {
 	baseCache
-	items map[interface{}]*simpleItem
+	items       map[interface{}]*simpleItem
+	tw          *timewheel.TimeWheel
+	expiredKeys chan interface{}
 }
 
 func newSimpleCache(cb *CacheBuilder) *SimpleCache {
 	c := &SimpleCache{}
 	buildCache(&c.baseCache, cb)
-
+	c.tw = timewheel.New(1e3, 1e3)
+	c.tw.SetCallback(c.gcKey)
+	c.expiredKeys = make(chan interface{}, 1e3)
+	go c.gc()
 	c.init()
 	c.loadGroup.cache = c
 	return c
@@ -25,6 +32,35 @@ func (c *SimpleCache) init() {
 	} else {
 		c.items = make(map[interface{}]*simpleItem, c.size)
 	}
+	c.tw.Purge()
+}
+
+func (me *SimpleCache) gc() {
+	/**
+	go func() {
+		time.Sleep(time.Second * 9)
+		log.Println(len(me.items))
+	}()
+	*/
+	keys := make([]interface{}, 0, 1e3)
+	for key := range me.expiredKeys {
+		keys = append(keys, key)
+		if len(keys) == 1e3 {
+			me.mu.Lock()
+			now := me.clock.Now()
+			for _, key := range keys {
+				if item, ok := me.items[key]; ok && item.IsExpired(&now) {
+					delete(me.items, key)
+				}
+			}
+			keys = keys[0:0]
+			me.mu.Unlock()
+		}
+	}
+}
+
+func (me *SimpleCache) gcKey(job *timewheel.Job) {
+	me.expiredKeys <- job.Id
 }
 
 // Set a new key-value pair
@@ -46,6 +82,10 @@ func (c *SimpleCache) SetWithExpire(key, value interface{}, expiration time.Dura
 
 	t := c.clock.Now().Add(expiration)
 	item.(*simpleItem).expiration = &t
+	c.tw.Add(&timewheel.Job{
+		Id:   key,
+		Time: t.Unix() + 5,
+	})
 	return nil
 }
 
@@ -77,6 +117,10 @@ func (c *SimpleCache) set(key, value interface{}) (interface{}, error) {
 	if c.expiration != nil {
 		t := c.clock.Now().Add(*c.expiration)
 		item.expiration = &t
+		c.tw.Add(&timewheel.Job{
+			Id:   key,
+			Time: t.Unix() + 5,
+		})
 	}
 
 	if c.addedFunc != nil {
@@ -132,6 +176,7 @@ func (c *SimpleCache) getValue(key interface{}, onLoad bool) (interface{}, error
 			return v, nil
 		}
 		c.remove(key)
+		//c.tw.Delete(key)
 	}
 	c.mu.Unlock()
 	if !onLoad {
@@ -157,6 +202,10 @@ func (c *SimpleCache) getWithLoader(key interface{}, isWait bool) (interface{}, 
 		if expiration != nil {
 			t := c.clock.Now().Add(*expiration)
 			item.(*simpleItem).expiration = &t
+			c.tw.Add(&timewheel.Job{
+				Id:   key,
+				Time: t.Unix() + 5,
+			})
 		}
 		return v, nil
 	}, isWait)
@@ -211,6 +260,7 @@ func (c *SimpleCache) remove(key interface{}) bool {
 		if c.evictedFunc != nil {
 			c.evictedFunc(key, item.value)
 		}
+		//c.tw.Delete(key)
 		return true
 	}
 	return false

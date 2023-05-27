@@ -1,3 +1,3 @@
-module github.com/bluele/gcache
+module github.com/puper/gcache
 
-go 1.15
+go 1.17
