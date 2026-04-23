@@ -28,6 +28,9 @@ import (
 // ErrNotFound 键不存在错误
 var ErrNotFound = errors.New("key not found")
 
+// ErrCapacityExceeded 容量或内部索引达到上限，无法继续写入
+var ErrCapacityExceeded = errors.New("capacity exceeded")
+
 // EvictReason 淘汰原因
 type EvictReason int
 
@@ -60,9 +63,11 @@ type EvictCallback[K comparable, V any] func(key K, value V, reason EvictReason)
 // Cache 缓存接口
 type Cache[K comparable, V any] interface {
 	// Set 设置键值对，使用默认 TTL
+	// 在容量达到边界且无法分配新条目时返回 ErrCapacityExceeded
 	Set(key K, value V) error
 
 	// SetWithExpire 设置键值对并指定过期时间
+	// 在容量达到边界且无法分配新条目时返回 ErrCapacityExceeded
 	SetWithExpire(key K, value V, ttl time.Duration) error
 
 	// Get 获取值，不存在返回 ErrNotFound

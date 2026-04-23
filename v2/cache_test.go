@@ -1,6 +1,8 @@
 package gcache
 
 import (
+	"errors"
+	"math/bits"
 	"strconv"
 	"sync"
 	"testing"
@@ -527,5 +529,164 @@ func TestUnlimitedCapacityShardCountNotCappedByCapacity(t *testing.T) {
 	// 300 会被归一化为 2 的幂（向下）：256
 	if got := len(c.shards); got != 256 {
 		t.Fatalf("expected 256 shards, got %d", got)
+	}
+}
+
+func TestSetReturnsErrCapacityExceededOnAllocFailure(t *testing.T) {
+	evictCalled := false
+	cache := New[string, int](1).
+		Shards(1).
+		OnEvict(func(key string, value int, reason EvictReason) {
+			evictCalled = true
+		}).
+		Build()
+	defer cache.Close()
+
+	c := cache.(*shardedCache[string, int])
+	shard := &c.shards[0]
+	shard.mu.Lock()
+	// 人工制造“无空闲索引”异常路径，验证错误语义与回调语义。
+	shard.list.free = invalidIndex
+	shard.mu.Unlock()
+
+	err := cache.Set("broken", 1)
+	if !errors.Is(err, ErrCapacityExceeded) {
+		t.Fatalf("expected ErrCapacityExceeded, got %v", err)
+	}
+	if evictCalled {
+		t.Fatal("expected no eviction callback when write failed")
+	}
+}
+
+func TestCapacityEvictionUsesExpiredReasonWhenTailExpired(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		reasons []EvictReason
+	)
+
+	cache := New[string, int](1).
+		Shards(1).
+		NoClean().
+		OnEvict(func(key string, value int, reason EvictReason) {
+			mu.Lock()
+			reasons = append(reasons, reason)
+			mu.Unlock()
+		}).
+		Build()
+	defer cache.Close()
+
+	if err := cache.SetWithExpire("a", 1, 20*time.Millisecond); err != nil {
+		t.Fatalf("set a failed: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	if err := cache.Set("b", 2); err != nil {
+		t.Fatalf("set b failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reasons) != 1 {
+		t.Fatalf("expected 1 eviction callback, got %d", len(reasons))
+	}
+	if reasons[0] != EvictReasonExpired {
+		t.Fatalf("expected eviction reason expired, got %s", reasons[0])
+	}
+}
+
+func TestTimeWheelSlotIndexAlwaysNonNegative(t *testing.T) {
+	tw := newTimeWheel(time.Second)
+	got := tw.slotIndex(-1)
+	if got < 0 || got >= tw.slotCount {
+		t.Fatalf("expected normalized index in [0, %d), got %d", tw.slotCount, got)
+	}
+}
+
+func TestTimeWheelRollbackResetsLastProcessedSlot(t *testing.T) {
+	tw := newTimeWheel(time.Second)
+	tw.lastProcessedSlot = 100
+
+	expired := tw.popExpired(50 * int64(time.Second))
+	if len(expired) != 0 {
+		t.Fatalf("expected no expired entries, got %d", len(expired))
+	}
+	if tw.lastProcessedSlot != 49 {
+		t.Fatalf("expected lastProcessedSlot reset to 49, got %d", tw.lastProcessedSlot)
+	}
+}
+
+func TestTimeWheelLargeGapCollectsHistoricalMappedSlots(t *testing.T) {
+	tw := newTimeWheel(time.Second)
+	tw.lastProcessedSlot = 0
+
+	const expiredIdx uint32 = 1
+	const futureIdx uint32 = 2
+
+	oldSlot := int64(10)
+	currentSlot := tw.slotCount + 1000
+	futureSlot := currentSlot + 5
+
+	oldBucket := tw.slotIndex(oldSlot)
+	tw.slots[oldBucket] = map[uint32]struct{}{expiredIdx: {}}
+	tw.indexToSlot[expiredIdx] = oldSlot
+
+	futureBucket := tw.slotIndex(futureSlot)
+	if tw.slots[futureBucket] == nil {
+		tw.slots[futureBucket] = make(map[uint32]struct{})
+	}
+	tw.slots[futureBucket][futureIdx] = struct{}{}
+	tw.indexToSlot[futureIdx] = futureSlot
+
+	expired := tw.popExpired(currentSlot * tw.resolution)
+
+	foundExpired := false
+	for _, idx := range expired {
+		if idx == expiredIdx {
+			foundExpired = true
+		}
+		if idx == futureIdx {
+			t.Fatal("future mapped slot should not be returned as expired")
+		}
+	}
+	if !foundExpired {
+		t.Fatal("expected historical mapped slot to be collected after large gap")
+	}
+	if _, ok := tw.indexToSlot[expiredIdx]; ok {
+		t.Fatal("expected historical mapped slot removed from indexToSlot")
+	}
+	if _, ok := tw.indexToSlot[futureIdx]; !ok {
+		t.Fatal("expected future mapped slot kept in indexToSlot")
+	}
+	if tw.lastProcessedSlot != currentSlot {
+		t.Fatalf("expected lastProcessedSlot=%d, got %d", currentSlot, tw.lastProcessedSlot)
+	}
+}
+
+func TestFloorPowerOfTwoMaxInt(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	got := floorPowerOfTwo(maxInt)
+	expected := 1 << (bits.Len(uint(maxInt)) - 1)
+
+	if got != expected {
+		t.Fatalf("expected %d, got %d", expected, got)
+	}
+	if got <= 0 || got > maxInt {
+		t.Fatalf("expected result in (0, %d], got %d", maxInt, got)
+	}
+	if got&(got-1) != 0 {
+		t.Fatalf("expected power of two, got %d", got)
+	}
+}
+
+func TestNormalizeWheelResolutionCapsTinyInput(t *testing.T) {
+	got := normalizeWheelResolution(time.Nanosecond)
+	minRes := time.Duration(ceilDiv64(int64(defaultWheelWindow), maxWheelSlots))
+
+	if got != minRes {
+		t.Fatalf("expected normalized resolution %v, got %v", minRes, got)
+	}
+	slotCount := ceilDiv64(int64(defaultWheelWindow), int64(got))
+	if slotCount > maxWheelSlots {
+		t.Fatalf("expected slotCount <= %d, got %d", maxWheelSlots, slotCount)
 	}
 }

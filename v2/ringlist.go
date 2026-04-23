@@ -74,6 +74,7 @@ func (r *ringList[K, V]) alloc() uint32 {
 
 // free 释放条目
 func (r *ringList[K, V]) freeEntry(idx uint32) {
+	r.mustValidIndex(idx)
 	e := &r.entries[idx]
 	var zeroK K
 	var zeroV V
@@ -89,6 +90,7 @@ func (r *ringList[K, V]) freeEntry(idx uint32) {
 
 // pushFront 将条目插入链表头部
 func (r *ringList[K, V]) pushFront(idx uint32) {
+	r.mustValidIndex(idx)
 	e := &r.entries[idx]
 	e.prev = invalidIndex
 	e.next = r.head
@@ -105,6 +107,7 @@ func (r *ringList[K, V]) pushFront(idx uint32) {
 
 // remove 从链表中移除条目
 func (r *ringList[K, V]) remove(idx uint32) {
+	r.mustValidIndex(idx)
 	e := &r.entries[idx]
 
 	if e.prev != invalidIndex {
@@ -149,7 +152,14 @@ func (r *ringList[K, V]) cap() int {
 
 // get 获取条目
 func (r *ringList[K, V]) get(idx uint32) *entry[K, V] {
+	r.mustValidIndex(idx)
 	return &r.entries[idx]
+}
+
+func (r *ringList[K, V]) mustValidIndex(idx uint32) {
+	if idx >= uint32(len(r.entries)) {
+		panic("gcache: ringList index out of range")
+	}
 }
 
 func (r *ringList[K, V]) grow() bool {
@@ -179,7 +189,11 @@ func (r *ringList[K, V]) grow() bool {
 	if newCap64 <= uint64(oldCap) {
 		return false
 	}
+	// 32 位系统防护：确保 newCap 不超过 int 最大值且大于 oldCap
 	newCap := int(newCap64)
+	if newCap <= oldCap {
+		return false
+	}
 
 	r.entries = append(r.entries, make([]entry[K, V], newCap-oldCap)...)
 

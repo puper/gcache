@@ -62,6 +62,7 @@ func (b *Builder[K, V]) Build() Cache[K, V] {
 		} else {
 			resolution = defaultResolution
 		}
+		resolution = normalizeWheelResolution(resolution)
 	}
 
 	return newShardedCache[K, V](b.capacity, b.ttl, resolution, b.onEvict, shardCount)

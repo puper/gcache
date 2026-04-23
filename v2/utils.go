@@ -7,9 +7,9 @@ var now = func() int64 {
 	return time.Now().UnixNano()
 }
 
-// isExpired 检查是否过期
-func isExpired(expireAt int64) bool {
-	return expireAt > 0 && now() > expireAt
+// isExpired 检查是否过期（使用调用方提供的统一时间基准）
+func isExpired(expireAt, nowNano int64) bool {
+	return expireAt > 0 && nowNano > expireAt
 }
 
 // expireTime 计算过期时间戳

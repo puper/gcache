@@ -18,7 +18,9 @@
 - 无限制容量模式下不做容量淘汰，LRU 存储按需扩容。
 - TTL 使用每分片单层环形时间轮（固定 24h 窗口）。
 - `Resolution` 可配置（如 1s / 1min），槽数由 `24h / resolution` 自动计算。
+- 为避免极小 `Resolution` 导致超大槽数组分配，内部会将分辨率归一化到“最大槽数上限”可承受范围。
 - 清理时按 `lastProcessedSlot -> currentSlot` 区间推进。
+- 若 `currentSlot - start` 跨度超过窗口大小，清理仅扫描一个窗口长度，并对历史 `mappedSlot < start` 条目做兜底回收，避免长时间持锁。
 
 3. 过期一致性
 - 到期队列采用惰性删除策略：更新 TTL 时只追加新到期记录。

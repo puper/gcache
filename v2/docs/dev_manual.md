@@ -5,6 +5,11 @@
 2. 基准测试（短跑）：`go test -bench=. -benchtime=1s -run=^$ ./...`
 3. 32 位交叉编译检查：`GOOS=linux GOARCH=386 go test -c ./...`
 
+## 版本与模块规范
+- `v2` 目录按独立 Go Module 维护，根目录必须存在 `go.mod`。
+- `module` 路径必须包含主版本后缀：`github.com/puper/gcache/v2`。
+- 对外示例导入路径统一使用 `github.com/puper/gcache/v2`。
+
 ## 验证重点
 - 构建通过且基础功能测试通过。
 - TTL 到期清理可触发 `EvictReasonExpired`。

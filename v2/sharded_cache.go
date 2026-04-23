@@ -95,15 +95,14 @@ func (c *shardedCache[K, V]) SetWithExpire(key K, value V, ttl time.Duration) er
 	hash := hash64(key)
 	shard := &c.shards[shardIndexByHash(hash, c.shardMask)]
 
-	expireAt := int64(0)
-	if ttl > 0 {
-		expireAt = now() + int64(ttl)
-	}
-
 	var evicted evictRecord[K, V]
 	var hasEvicted bool
 
 	shard.mu.Lock()
+	expireAt := int64(0)
+	if ttl > 0 {
+		expireAt = now() + int64(ttl)
+	}
 
 	if idx, ok := shard.items[key]; ok {
 		e := shard.list.get(idx)
@@ -131,10 +130,8 @@ func (c *shardedCache[K, V]) SetWithExpire(key K, value V, ttl time.Duration) er
 	idx := shard.list.alloc()
 	if idx == invalidIndex {
 		shard.mu.Unlock()
-		if hasEvicted {
-			c.fireOnEvict(evicted)
-		}
-		return nil
+		// 写入未成功时不触发回调，避免对外呈现“写入成功并淘汰”的错误语义。
+		return ErrCapacityExceeded
 	}
 
 	e := shard.list.get(idx)
@@ -172,7 +169,8 @@ func (c *shardedCache[K, V]) Get(key K) (V, error) {
 	}
 
 	e := shard.list.get(idx)
-	if isExpired(e.expireAt) {
+	nowNano := now()
+	if isExpired(e.expireAt, nowNano) {
 		evicted, _ := shard.removeIndexLocked(idx, EvictReasonExpired)
 		shard.mu.Unlock()
 		c.stats.miss()
@@ -258,7 +256,8 @@ func (c *shardedCache[K, V]) Has(key K) bool {
 	}
 
 	e := shard.list.get(idx)
-	if isExpired(e.expireAt) {
+	nowNano := now()
+	if isExpired(e.expireAt, nowNano) {
 		evicted, _ := shard.removeIndexLocked(idx, EvictReasonExpired)
 		shard.mu.Unlock()
 		c.fireOnEvict(evicted)
@@ -367,6 +366,12 @@ func (s *cacheShard[K, V]) evictTailLocked(reason EvictReason) (evictRecord[K, V
 		var empty evictRecord[K, V]
 		return empty, false
 	}
+	if reason == EvictReasonCapacity {
+		e := s.list.get(idx)
+		if isExpired(e.expireAt, now()) {
+			reason = EvictReasonExpired
+		}
+	}
 	return s.removeIndexLocked(idx, reason)
 }
 
@@ -396,7 +401,7 @@ func (c *shardedCache[K, V]) fireOnEvict(rec evictRecord[K, V]) {
 	if c.onEvict != nil {
 		defer func() {
 			// 用户回调属于不可信边界，隔离 panic 以避免影响缓存主流程。
-			_ = recover()
+			recover()
 		}()
 		c.onEvict(rec.key, rec.value, rec.reason)
 	}
@@ -407,7 +412,7 @@ func floorPowerOfTwo(v int) int {
 		return 1
 	}
 	p := 1
-	for p<<1 <= v {
+	for p <= v/2 {
 		p <<= 1
 	}
 	return p

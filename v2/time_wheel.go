@@ -4,6 +4,8 @@ import "time"
 
 const defaultWheelWindow = 24 * time.Hour
 
+const maxWheelSlots int64 = 1 << 24
+
 type timeWheel struct {
 	slots             []map[uint32]struct{}
 	indexToSlot       map[uint32]int64
@@ -13,15 +15,10 @@ type timeWheel struct {
 }
 
 func newTimeWheel(resolution time.Duration) *timeWheel {
-	if resolution <= 0 {
-		resolution = time.Second
-	}
+	resolution = normalizeWheelResolution(resolution)
 
 	resNanos := int64(resolution)
-	slotCount := int64(defaultWheelWindow / resolution)
-	if defaultWheelWindow%resolution != 0 {
-		slotCount++
-	}
+	slotCount := ceilDiv64(int64(defaultWheelWindow), resNanos)
 	if slotCount < 1 {
 		slotCount = 1
 	}
@@ -35,6 +32,28 @@ func newTimeWheel(resolution time.Duration) *timeWheel {
 		slotCount:         slotCount,
 		lastProcessedSlot: currentSlot - 1,
 	}
+}
+
+func normalizeWheelResolution(resolution time.Duration) time.Duration {
+	if resolution <= 0 {
+		return time.Second
+	}
+	if resolution > defaultWheelWindow {
+		return defaultWheelWindow
+	}
+
+	resNanos := int64(resolution)
+	slotCount := ceilDiv64(int64(defaultWheelWindow), resNanos)
+	if slotCount <= maxWheelSlots {
+		return resolution
+	}
+
+	minResNanos := ceilDiv64(int64(defaultWheelWindow), maxWheelSlots)
+	return time.Duration(minResNanos)
+}
+
+func ceilDiv64(a, b int64) int64 {
+	return (a + b - 1) / b
 }
 
 func (tw *timeWheel) add(idx uint32, expireAtNano int64) {
@@ -88,7 +107,14 @@ func (tw *timeWheel) popExpired(nowNano int64) []uint32 {
 
 	start := tw.lastProcessedSlot + 1
 	if start > currentSlot {
+		// 系统时间回拨时重置推进点，避免长期跳过过期扫描。
+		tw.lastProcessedSlot = currentSlot - 1
 		return nil
+	}
+	// 若系统长时间停顿导致跨度过大，仅扫描一个窗口长度的 slot。
+	// 对于更旧的 mappedSlot，后续通过 mappedSlot < start 条件进行兜底回收。
+	if span := currentSlot - start + 1; span > tw.slotCount {
+		start = currentSlot - tw.slotCount + 1
 	}
 
 	for slotKey := start; slotKey <= currentSlot; slotKey++ {
@@ -104,7 +130,13 @@ func (tw *timeWheel) popExpired(nowNano int64) []uint32 {
 				delete(bucket, idx)
 				continue
 			}
-			if mappedSlot != slotKey {
+			// mappedSlot==slotKey：常规到期槽位；
+			// mappedSlot<start：大跨度追赶时的历史槽位，需兜底处理；
+			// mappedSlot>currentSlot：未来槽位，保留等待后续处理。
+			if mappedSlot > currentSlot {
+				continue
+			}
+			if mappedSlot != slotKey && mappedSlot >= start {
 				continue
 			}
 
@@ -129,7 +161,11 @@ func (tw *timeWheel) clear() {
 }
 
 func (tw *timeWheel) slotIndex(slotKey int64) int64 {
-	return slotKey % tw.slotCount
+	idx := slotKey % tw.slotCount
+	if idx < 0 {
+		idx += tw.slotCount
+	}
+	return idx
 }
 
 func (tw *timeWheel) scheduleSlot(expireAtNano int64) int64 {
