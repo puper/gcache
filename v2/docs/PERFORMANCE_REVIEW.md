@@ -167,14 +167,14 @@ func (c *shardedCache[K, V]) cleanExpired(nowNano int64) {
         var evicted []evictRecord[K, V]  // 每次分配新 slice
 
         shard.mu.Lock()
-        expiredIdxes := shard.wheel.popExpired(nowNano)
+        shard.wheel.popExpiredInto(nowNano, &shard.expiredBuf)
         // ...
 ```
 
 **问题分析**:
 - 每次 cleanLoop tick 都分配新的 `evicted` slice
 - 高频过期场景（短 TTL + 高吞吐）产生 GC 压力
-- `popExpired` 也返回新分配的 slice（见 1.4）
+- `popExpiredInto` 通过传入 buffer 复用消除 tick 级分配
 
 **优化方案**:
 
@@ -221,29 +221,22 @@ func (c *shardedCache[K, V]) cleanExpired(nowNano int64) {
 **权衡**:
 - ✅ 消除 tick 级别的内存分配
 - ⚠️ 增加分片结构体内存占用（通常 < 1KB）
-- ⚠️ 需要同步修改 `popExpired` 接口
+- ⚠️ 需要同步修改 `popExpiredInto` 接口（已实施）
 
 **预估工作量**: 1.5 小时
 
 ---
 
-### 1.4 timeWheel.popExpired 返回新 slice [P3]
+### 1.4 timeWheel.popExpiredInto 返回新 slice [P3]（已修复）
 
-**位置**: `time_wheel.go:85-125`
+**位置**: `time_wheel.go:104-150`
 
+优化前：`popExpired` 每次调用分配新 slice
 ```go
 func (tw *timeWheel) popExpired(nowNano int64) []uint32 {
     currentSlot := nowNano / tw.resolution
     var expired []uint32  // 每次分配新 slice
-
     // ...
-    for slotKey := start; slotKey <= currentSlot; slotKey++ {
-        // ...
-        for idx := range bucket {
-            expired = append(expired, idx)
-            // ...
-        }
-    }
     return expired
 }
 ```
@@ -457,7 +450,7 @@ func (c *shardedCache[K, V]) Purge() {
 | 问题 | 影响 | 收益 | 工作量 | 建议 |
 |------|------|------|--------|------|
 | cleanExpired buffer 分配 | GC 压力 | 消除 tick 级分配 | 2h | 视场景评估 |
-| popExpired buffer 分配 | GC 压力 | 配合上述 | 0.5h | 视场景评估 |
+| popExpiredInto buffer 复用 | GC 压力 | 配合上述 | 0.5h | 视场景评估 |
 
 ### 低优先级（P4）
 
@@ -503,7 +496,7 @@ func (c *shardedCache[K, V]) Purge() {
 
 **实施步骤**:
 1. 在 `cacheShard` 添加 buffer 字段
-2. 修改 `popExpired` 为 `popExpiredInto`
+2. 修改 `popExpired` 为 `popExpiredInto`（已完成）
 3. cleanExpired 使用分片级 buffer
 4. 添加基准测试对比 GC 压力
 

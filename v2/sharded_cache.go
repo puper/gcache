@@ -2,6 +2,7 @@ package gcache
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -11,6 +12,10 @@ type cacheShard[K comparable, V any] struct {
 	list       *ringList[K, V]
 	wheel      *timeWheel
 	maxEntries uint32 // 0 表示无限容量
+
+	// 复用 buffer，消除 cleanLoop tick 级内存分配
+	expiredBuf []uint32          // 过期索引 buffer
+	evictedBuf []evictRecord[K, V] // 淘汰记录 buffer
 }
 
 type evictRecord[K comparable, V any] struct {
@@ -26,6 +31,7 @@ type shardedCache[K comparable, V any] struct {
 	resolution time.Duration
 	onEvict    EvictCallback[K, V]
 	stats      stats
+	count      atomic.Int64 // 原子计数器，提供 O(1) 无锁 Len()
 
 	closeOnce sync.Once
 	stopCh    chan struct{}
@@ -99,9 +105,11 @@ func (c *shardedCache[K, V]) SetWithExpire(key K, value V, ttl time.Duration) er
 	var hasEvicted bool
 
 	shard.mu.Lock()
+
 	expireAt := int64(0)
+	nowNano := now()
 	if ttl > 0 {
-		expireAt = now() + int64(ttl)
+		expireAt = nowNano + int64(ttl)
 	}
 
 	if idx, ok := shard.items[key]; ok {
@@ -124,13 +132,13 @@ func (c *shardedCache[K, V]) SetWithExpire(key K, value V, ttl time.Duration) er
 	}
 
 	if shard.maxEntries > 0 && shard.list.len() >= shard.maxEntries {
-		evicted, hasEvicted = shard.evictTailLocked(EvictReasonCapacity)
+		evicted, hasEvicted = shard.evictTailLocked(EvictReasonCapacity, nowNano)
 	}
 
 	idx := shard.list.alloc()
 	if idx == invalidIndex {
 		shard.mu.Unlock()
-		// 写入未成功时不触发回调，避免对外呈现“写入成功并淘汰”的错误语义。
+		// 写入未成功时不触发回调，避免对外呈现"写入成功并淘汰"的错误语义。
 		return ErrCapacityExceeded
 	}
 
@@ -147,6 +155,11 @@ func (c *shardedCache[K, V]) SetWithExpire(key K, value V, ttl time.Duration) er
 	}
 
 	shard.mu.Unlock()
+
+	if !hasEvicted {
+		// 全新条目写入（未触发容量淘汰），总数 +1
+		c.count.Add(1)
+	}
 
 	if hasEvicted {
 		c.fireOnEvict(evicted)
@@ -173,6 +186,7 @@ func (c *shardedCache[K, V]) Get(key K) (V, error) {
 	if isExpired(e.expireAt, nowNano) {
 		evicted, _ := shard.removeIndexLocked(idx, EvictReasonExpired)
 		shard.mu.Unlock()
+		c.count.Add(-1)
 		c.stats.miss()
 		c.fireOnEvict(evicted)
 		return zero, ErrNotFound
@@ -201,47 +215,97 @@ func (c *shardedCache[K, V]) Remove(key K) bool {
 		return false
 	}
 
-	evicted, _ := shard.removeIndexLocked(idx, EvictReasonManual)
+	evicted, ok := shard.removeIndexLocked(idx, EvictReasonManual)
 	shard.mu.Unlock()
-	c.fireOnEvict(evicted)
-	return true
+	if ok {
+		c.count.Add(-1)
+		c.fireOnEvict(evicted)
+	}
+	return ok
 }
 
-func (c *shardedCache[K, V]) Purge() {
+func (c *shardedCache[K, V]) Purge(notify bool) {
+	var (
+		wg           sync.WaitGroup
+		totalRemoved atomic.Int64
+	)
+
 	for i := range c.shards {
-		shard := &c.shards[i]
-		var evicted []evictRecord[K, V]
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			shard := &c.shards[idx]
 
-		shard.mu.Lock()
-		idx := shard.list.head
-		for idx != invalidIndex {
-			next := shard.list.get(idx).next
-			rec, ok := shard.removeIndexLocked(idx, EvictReasonManual)
-			if ok {
-				evicted = append(evicted, rec)
+			shard.mu.Lock()
+
+			if notify {
+				// 需要回调：逐条删除并收集记录
+				var evicted []evictRecord[K, V]
+				cur := shard.list.head
+				for cur != invalidIndex {
+					next := shard.list.get(cur).next
+					rec, ok := shard.removeIndexLocked(cur, EvictReasonManual)
+					if ok {
+						evicted = append(evicted, rec)
+					}
+					cur = next
+				}
+				if shard.wheel != nil {
+					shard.wheel.clear()
+				}
+				removed := int64(len(evicted))
+				shard.mu.Unlock()
+
+				// 锁外逐条触发回调，避免全量汇总到全局切片再回调的内存峰值
+				for _, rec := range evicted {
+					c.fireOnEvict(rec)
+				}
+				if removed > 0 {
+					totalRemoved.Add(removed)
+				}
+			} else {
+				// 不需要回调：直接重置数据结构，O(cap) 零化 + O(1) 重置
+				removed := int64(shard.list.count) // 记录实际条目数，不是总容量
+				cap := uint32(len(shard.list.entries))
+				shard.items = make(map[K]uint32, len(shard.items))
+				shard.list.head = invalidIndex
+				shard.list.tail = invalidIndex
+				shard.list.free = 0
+				shard.list.count = 0
+				for j := uint32(0); j < cap; j++ {
+					if j < cap-1 {
+						shard.list.entries[j].next = j + 1
+					} else {
+						shard.list.entries[j].next = invalidIndex
+					}
+					shard.list.entries[j].prev = invalidIndex
+					var zeroK K
+					var zeroV V
+					shard.list.entries[j].key = zeroK
+					shard.list.entries[j].value = zeroV
+					shard.list.entries[j].keyHash = 0
+					shard.list.entries[j].expireAt = 0
+				}
+				if shard.wheel != nil {
+					shard.wheel.clear()
+				}
+				shard.mu.Unlock()
+				if removed > 0 {
+					totalRemoved.Add(removed)
+				}
 			}
-			idx = next
-		}
-		if shard.wheel != nil {
-			shard.wheel.clear()
-		}
-		shard.mu.Unlock()
+		}(i)
+	}
 
-		for _, rec := range evicted {
-			c.fireOnEvict(rec)
-		}
+	wg.Wait()
+
+	if n := totalRemoved.Load(); n > 0 {
+		c.count.Add(-n)
 	}
 }
 
 func (c *shardedCache[K, V]) Len() int {
-	total := 0
-	for i := range c.shards {
-		shard := &c.shards[i]
-		shard.mu.Lock()
-		total += int(shard.list.len())
-		shard.mu.Unlock()
-	}
-	return total
+	return int(c.count.Load())
 }
 
 func (c *shardedCache[K, V]) Has(key K) bool {
@@ -260,6 +324,7 @@ func (c *shardedCache[K, V]) Has(key K) bool {
 	if isExpired(e.expireAt, nowNano) {
 		evicted, _ := shard.removeIndexLocked(idx, EvictReasonExpired)
 		shard.mu.Unlock()
+		c.count.Add(-1)
 		c.fireOnEvict(evicted)
 		return false
 	}
@@ -324,11 +389,10 @@ func (c *shardedCache[K, V]) cleanExpired(nowNano int64) {
 			continue
 		}
 
-		var evicted []evictRecord[K, V]
-
 		shard.mu.Lock()
-		expiredIdxes := shard.wheel.popExpired(nowNano)
-		for _, idx := range expiredIdxes {
+		shard.wheel.popExpiredInto(nowNano, &shard.expiredBuf)
+		shard.evictedBuf = shard.evictedBuf[:0]
+		for _, idx := range shard.expiredBuf {
 			if idx >= uint32(len(shard.list.entries)) {
 				continue
 			}
@@ -349,18 +413,19 @@ func (c *shardedCache[K, V]) cleanExpired(nowNano int64) {
 
 			rec, ok := shard.removeIndexLocked(idx, EvictReasonExpired)
 			if ok {
-				evicted = append(evicted, rec)
+				c.count.Add(-1)
+				shard.evictedBuf = append(shard.evictedBuf, rec)
 			}
 		}
 		shard.mu.Unlock()
 
-		for _, rec := range evicted {
+		for _, rec := range shard.evictedBuf {
 			c.fireOnEvict(rec)
 		}
 	}
 }
 
-func (s *cacheShard[K, V]) evictTailLocked(reason EvictReason) (evictRecord[K, V], bool) {
+func (s *cacheShard[K, V]) evictTailLocked(reason EvictReason, nowNano int64) (evictRecord[K, V], bool) {
 	idx := s.list.back()
 	if idx == invalidIndex {
 		var empty evictRecord[K, V]
@@ -368,7 +433,7 @@ func (s *cacheShard[K, V]) evictTailLocked(reason EvictReason) (evictRecord[K, V
 	}
 	if reason == EvictReasonCapacity {
 		e := s.list.get(idx)
-		if isExpired(e.expireAt, now()) {
+		if isExpired(e.expireAt, nowNano) {
 			reason = EvictReasonExpired
 		}
 	}

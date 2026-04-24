@@ -30,7 +30,7 @@
 未在本轮处理（保持原结论，按需排期）：
 - [ ] `Len()` 原子计数优化
 - [ ] `Purge()` 分片并行化
-- [ ] `cleanExpired`/`popExpired` buffer 复用
+- [ ] `cleanExpired`/`popExpiredInto` buffer 复用（原 `popExpired`）
 
 ---
 
@@ -308,7 +308,7 @@ shard.evictBuf = shard.evictBuf[:0]  // 重置长度，复用容量
 
 ---
 
-### 问题 9: 时间轮 popExpired 返回新 slice
+### 问题 9: 时间轮 popExpiredInto 返回新 slice（原 popExpired）
 
 | 属性 | 值 |
 |------|-----|

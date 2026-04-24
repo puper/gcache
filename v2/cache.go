@@ -81,8 +81,10 @@ type Cache[K comparable, V any] interface {
 	// Remove 删除指定键，返回是否删除成功
 	Remove(key K) bool
 
-	// Purge 清空缓存，触发所有条目的手动淘汰回调
-	Purge()
+	// Purge 清空缓存。
+	// notify 为 true 时触发每个条目的手动淘汰回调；
+	// notify 为 false 时直接清空，不触发回调（更快，适合重启/重建场景）。
+	Purge(notify bool)
 
 	// Len 返回缓存条目数
 	Len() int

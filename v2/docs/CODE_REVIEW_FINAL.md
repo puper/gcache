@@ -42,7 +42,7 @@ PASS
 
 | # | 问题 | 修复位置 |
 |---|------|----------|
-| 6 | popExpired 长时间持锁 | `time_wheel.go:116-118` |
+| 6 | popExpiredInto 长时间持锁（原 popExpired） | `time_wheel.go:116-118` |
 | 7 | now() 锁外调用 | `sharded_cache.go:101-105` |
 | 8 | isExpired 时间一致性 | `utils.go:11-12` |
 | 9 | grow() 32位溢出 | `ringlist.go:192-196` |

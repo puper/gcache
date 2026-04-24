@@ -63,7 +63,7 @@ idx := uint32(hash64(key) & shardMask)
 2. 后台清理（可选）
 - 启动条件：`ttl > 0 && !NoClean() && resolution > 0`
 - 调度方式：`ticker(resolution)` 驱动 `cleanLoop`
-- 清理对象：每个分片的 `timeWheel.popExpired(now)` 返回的候选索引
+- 清理对象：每个分片的 `timeWheel.popExpiredInto(nowNano, &shard.expiredBuf)` 写入的候选索引
 - 删除前校验：当前 `items` 映射和 `expireAt` 双重校验，避免误删旧索引
 
 3. 长 TTL 处理
@@ -84,7 +84,8 @@ type Cache[K comparable, V any] interface {
     Get(key K) (V, error)
     GetIFPresent(key K) (V, error)
     Remove(key K) bool
-    Purge()
+    // notify=true 触发每个条目的手动淘汰回调；notify=false 直接清空（不触发回调）。
+    Purge(notify bool)
     Len() int
     Has(key K) bool
     Close()
@@ -137,8 +138,8 @@ cache := gcache.New[string, *User](10000).
 ```go
 for range ticker(resolution) {
     for each shard {
-        idxes := shard.wheel.popExpired(now)
-        for idx in idxes {
+        shard.wheel.popExpiredInto(nowNano, &shard.expiredBuf)
+        for idx in shard.expiredBuf {
             // 校验索引有效 + 当前映射一致 + 真实到期
             // 未真实到期（长 TTL 提前触发）则续挂
             // 已到期则删除并记录回调

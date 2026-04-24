@@ -24,7 +24,7 @@
 | 3 | ringList 边界检查 | `ringlist.go:159-163` | ✅ |
 | 4 | 容量淘汰原因修正 | `sharded_cache.go:369-373` | ✅ |
 | 5 | 时间回退处理 | `time_wheel.go:90-93` | ✅ |
-| 6 | popExpired 长时间持锁 | `time_wheel.go:97-99` | ✅ |
+| 6 | popExpiredInto 长时间持锁（原 popExpired） | `time_wheel.go:97-99` | ✅ |
 | 7 | now() 锁外调用 | `sharded_cache.go:101-105` | ✅ |
 | 8 | isExpired 时间一致性 | `utils.go:11-12` | ✅ |
 | 9 | grow() 32位溢出 | `ringlist.go:194-197` | ✅ |

@@ -101,15 +101,15 @@ func (tw *timeWheel) remove(idx uint32, _ int64) {
 	delete(tw.indexToSlot, idx)
 }
 
-func (tw *timeWheel) popExpired(nowNano int64) []uint32 {
+func (tw *timeWheel) popExpiredInto(nowNano int64, buf *[]uint32) {
 	currentSlot := nowNano / tw.resolution
-	var expired []uint32
+	*buf = (*buf)[:0]
 
 	start := tw.lastProcessedSlot + 1
 	if start > currentSlot {
 		// 系统时间回拨时重置推进点，避免长期跳过过期扫描。
 		tw.lastProcessedSlot = currentSlot - 1
-		return nil
+		return
 	}
 	// 若系统长时间停顿导致跨度过大，仅扫描一个窗口长度的 slot。
 	// 对于更旧的 mappedSlot，后续通过 mappedSlot < start 条件进行兜底回收。
@@ -140,7 +140,7 @@ func (tw *timeWheel) popExpired(nowNano int64) []uint32 {
 				continue
 			}
 
-			expired = append(expired, idx)
+			*buf = append(*buf, idx)
 			delete(bucket, idx)
 			delete(tw.indexToSlot, idx)
 		}
@@ -151,7 +151,6 @@ func (tw *timeWheel) popExpired(nowNano int64) []uint32 {
 	}
 
 	tw.lastProcessedSlot = currentSlot
-	return expired
 }
 
 func (tw *timeWheel) clear() {

@@ -11,7 +11,7 @@
 ## 修复进展（2026-04-23，第二轮处置）
 
 已完成（代码与测试已落地）：
-- [x] `popExpired` 大跨度追赶优化：将扫描窗口限制为 `slotCount`，并对 `mappedSlot < start` 做兜底回收，避免长时间持锁
+- [x] `popExpiredInto` 大跨度追赶优化（原 `popExpired`）：将扫描窗口限制为 `slotCount`，并对 `mappedSlot < start` 做兜底回收，避免长时间持锁
 - [x] 统一过期判定时间基准：`isExpired(expireAt, nowNano)` 参数化
 - [x] `SetWithExpire` 时间戳改为锁内采样，避免锁等待导致的边界时间漂移
 - [x] 新增回归测试：覆盖大跨度追赶下“历史槽位回收 + 未来槽位保留”语义
@@ -27,7 +27,7 @@
 | SetWithExpire alloc 失败处理 | ✅ 已修复 | 返回 `ErrCapacityExceeded` (第135行) |
 | ringList 边界检查 | ✅ 已修复 | 添加 `mustValidIndex()` 方法 (第159-163行) |
 | 容量淘汰原因修正 | ✅ 已修复 | `evictTailLocked` 检查过期状态 (第368-373行) |
-| 时间回退处理 | ✅ 已修复 | `popExpired` 重置 `lastProcessedSlot` (第91-92行) |
+| 时间回退处理 | ✅ 已修复 | `popExpiredInto` 重置 `lastProcessedSlot` (第91-92行) |
 
 ### 测试验证
 
@@ -47,7 +47,7 @@ PASS
 
 ## 🔴 新发现 P0 级别问题
 
-### 问题 1: 时间轮 `popExpired` 长时间持锁风险
+### 问题 1: 时间轮 `popExpiredInto` 长时间持锁风险
 
 | 属性 | 值 |
 |------|-----|
@@ -68,17 +68,17 @@ for slotKey := start; slotKey <= currentSlot; slotKey++ {
 
 **影响**: 阻塞所有其他缓存操作，可能导致服务超时。
 
-**建议修复**:
+**建议修复**（已落地为 `popExpiredInto`，采用 buffer 传入 + 窗口限制联合方案）:
 
 ```go
-func (tw *timeWheel) popExpired(nowNano int64) []uint32 {
+func (tw *timeWheel) popExpiredInto(nowNano int64, buf *[]uint32) {
     currentSlot := nowNano / tw.resolution
-    var expired []uint32
+    *buf = (*buf)[:0]
 
     start := tw.lastProcessedSlot + 1
     if start > currentSlot {
         tw.lastProcessedSlot = currentSlot - 1
-        return nil
+        return
     }
 
     // 限制每次最多扫描的 slot 数量
@@ -93,7 +93,6 @@ func (tw *timeWheel) popExpired(nowNano int64) []uint32 {
     }
 
     tw.lastProcessedSlot = end
-    return expired
 }
 ```
 
@@ -214,7 +213,7 @@ func isExpired(expireAt, nowNano int64) bool {
 | Len() 串行锁 | `sharded_cache.go:236` | 监控瓶颈 | P2 - 可选优化 |
 | Purge() 串行锁 | `sharded_cache.go:210` | 大缓存清空阻塞 | P2 - 可选优化 |
 | cleanExpired 分配 | `sharded_cache.go:326` | GC 压力 | P3 - 可选优化 |
-| popExpired 返回新 slice | `time_wheel.go:85` | GC 压力 | P3 - 可选优化 |
+| popExpiredInto 返回新 slice | `time_wheel.go:104` | GC 压力 | P3 - 已修复 |
 
 ### 基准测试数据
 
@@ -262,7 +261,7 @@ P0 修复未引入可测量回归：
 
 | 级别 | 问题 | 文件:行号 | 影响 |
 |------|------|-----------|------|
-| **P0** | popExpired 长时间持锁 | time_wheel.go:96 | 系统恢复后服务阻塞 |
+| **P0** | popExpiredInto 长时间持锁 | time_wheel.go:104 | 系统恢复后服务阻塞 |
 | **P0** | now() 在锁外调用 | sharded_cache.go:100 | 边界时间不一致 |
 | **P1** | grow() 32位溢出 | ringlist.go:192 | 32位系统异常 |
 | **P1** | fireOnEvict 丢弃 panic | sharded_cache.go:403 | 调试困难 |
@@ -270,7 +269,7 @@ P0 修复未引入可测量回归：
 | **P2** | Len() 串行锁获取 | sharded_cache.go:236 | 监控性能 |
 | **P2** | Purge() 串行锁获取 | sharded_cache.go:210 | 清空性能 |
 | **P3** | cleanExpired 内存分配 | sharded_cache.go:326 | GC 压力 |
-| **P3** | popExpired 返回新 slice | time_wheel.go:85 | GC 压力 |
+| **P3** | popExpiredInto 返回新 slice | time_wheel.go:104 | GC 压力 |
 
 ---
 
@@ -278,7 +277,7 @@ P0 修复未引入可测量回归：
 
 ### 第一阶段：安全修复（P0）
 
-1. **popExpired 长持锁** - 限制每次扫描 slot 数量
+1. **popExpiredInto 长持锁** - 限制每次扫描 slot 数量
 2. **now() 锁外调用** - 移入锁内或统一时间基准
 
 ### 第二阶段：正确性修复（P1）

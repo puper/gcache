@@ -118,10 +118,52 @@ func TestPurge(t *testing.T) {
 	cache.Set("b", 2)
 	cache.Set("c", 3)
 
-	cache.Purge()
+	cache.Purge(true)
 
 	if cache.Len() != 0 {
 		t.Errorf("expected len 0 after purge, got %d", cache.Len())
+	}
+
+	cache.Close()
+}
+
+func TestPurgeNoNotify(t *testing.T) {
+	var mu sync.Mutex
+	var evictCount int
+
+	cache := New[string, int](100).
+		OnEvict(func(key string, value int, reason EvictReason) {
+			mu.Lock()
+			defer mu.Unlock()
+			evictCount++
+		}).
+		Build()
+
+	cache.Set("a", 1)
+	cache.Set("b", 2)
+	cache.Set("c", 3)
+
+	cache.Purge(false)
+
+	if cache.Len() != 0 {
+		t.Errorf("expected len 0 after purge, got %d", cache.Len())
+	}
+
+	mu.Lock()
+	if evictCount != 0 {
+		t.Errorf("expected 0 evictions with notify=false, got %d", evictCount)
+	}
+	mu.Unlock()
+
+	if err := cache.Set("x", 10); err != nil {
+		t.Errorf("unexpected error on Set after purge: %v", err)
+	}
+	v, err := cache.Get("x")
+	if err != nil {
+		t.Errorf("unexpected error on Get after purge: %v", err)
+	}
+	if v != 10 {
+		t.Errorf("expected 10, got %d", v)
 	}
 
 	cache.Close()
@@ -190,6 +232,60 @@ func TestExpireCallback(t *testing.T) {
 
 	if len(expired) != 1 || expired[0] != "ttl" {
 		t.Errorf("expected 'ttl' to be expired, got: %v", expired)
+	}
+
+	cache.Close()
+}
+
+func TestPurgeNoNotifyNoCallbacks(t *testing.T) {
+	cache := New[string, int](100).
+		TTL(50 * time.Millisecond).
+		OnEvict(func(key string, value int, reason EvictReason) {
+			t.Errorf("Purge(false) 不应触发任何回调, key=%s reason=%v", key, reason)
+		}).
+		Build()
+
+	cache.Set("a", 1)
+	cache.Set("b", 2)
+
+	// 等待部分条目过期
+	time.Sleep(60 * time.Millisecond)
+	cache.Set("c", 3) // 新条目，未过期
+
+	// Purge(false) — 不应触发任何 OnEvict 回调
+	cache.Purge(false)
+
+	if cache.Len() != 0 {
+		t.Errorf("Purge(false) 后 Len() != 0, got %d", cache.Len())
+	}
+
+	cache.Close()
+}
+
+func TestPurgeNoNotifyConcurrent(t *testing.T) {
+	cache := New[int, int](1000).Build()
+
+	for i := 0; i < 100; i++ {
+		cache.Set(i, i)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cache.Purge(false)
+		}()
+	}
+	wg.Wait()
+
+	if cache.Len() != 0 {
+		t.Errorf("并发 Purge(false) 后 Len() != 0, got %d", cache.Len())
+	}
+
+	// 验证 Purge(false) 后可正常写入
+	if err := cache.Set(999, 999); err != nil {
+		t.Errorf("Purge(false) 后 Set 失败: %v", err)
 	}
 
 	cache.Close()
@@ -606,9 +702,10 @@ func TestTimeWheelRollbackResetsLastProcessedSlot(t *testing.T) {
 	tw := newTimeWheel(time.Second)
 	tw.lastProcessedSlot = 100
 
-	expired := tw.popExpired(50 * int64(time.Second))
-	if len(expired) != 0 {
-		t.Fatalf("expected no expired entries, got %d", len(expired))
+	var buf []uint32
+	tw.popExpiredInto(50*int64(time.Second), &buf)
+	if len(buf) != 0 {
+		t.Fatalf("expected no expired entries, got %d", len(buf))
 	}
 	if tw.lastProcessedSlot != 49 {
 		t.Fatalf("expected lastProcessedSlot reset to 49, got %d", tw.lastProcessedSlot)
@@ -637,10 +734,11 @@ func TestTimeWheelLargeGapCollectsHistoricalMappedSlots(t *testing.T) {
 	tw.slots[futureBucket][futureIdx] = struct{}{}
 	tw.indexToSlot[futureIdx] = futureSlot
 
-	expired := tw.popExpired(currentSlot * tw.resolution)
+	var buf []uint32
+	tw.popExpiredInto(currentSlot*tw.resolution, &buf)
 
 	foundExpired := false
-	for _, idx := range expired {
+	for _, idx := range buf {
 		if idx == expiredIdx {
 			foundExpired = true
 		}
